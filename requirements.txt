@@ -1,0 +1,11 @@
+torch>=2.2.0
+torchaudio>=2.2.0
+
+faster-whisper>=1.0.1
+soundfile>=0.12.1
+
+gradio>=4.44.0
+python-dotenv>=1.0.1
+
+llama-cpp-python>=0.2.85    # CPU works out of the box; use cuBLAS wheel for NVIDIA
+chatterbox-tts==0.1.2
