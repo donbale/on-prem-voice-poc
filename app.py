@@ -1,212 +1,267 @@
-# app.py — Fast Windows PoC (LLM via llama.cpp GGUF, Whisper STT, Chatterbox TTS, Gradio UI)
 import os
+import time
 import tempfile
-from typing import List, Dict, Optional
+from typing import Iterable, List, Tuple
 
+import numpy as np
+import soundfile as sf
+import streamlit as st
 import torch
 import torchaudio
-import gradio as gr
-from dotenv import load_dotenv
+import base64
 
-load_dotenv()
-
-# ---------- Config ----------
-GGUF_PATH = os.environ.get("GGUF_PATH", r"C:\models\tinyllama-1.1b-chat-q4_k_m.gguf")
-N_CTX = int(os.environ.get("N_CTX", "4096"))
-N_THREADS = int(os.environ.get("N_THREADS", max(1, os.cpu_count() - 1)))
-N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "0"))
-
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "160"))
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.6"))
-TOP_P = float(os.environ.get("TOP_P", "0.9"))
-
-WHISPER_SIZE = os.environ.get("WHISPER_SIZE", "base.en")
-TTS_CFG_WEIGHT = float(os.environ.get("TTS_CFG_WEIGHT", "0.4"))
-TTS_EXAGGERATION = float(os.environ.get("TTS_EXAGGERATION", "0.35"))
-
-GRADIO_PORT = int(os.environ.get("GRADIO_PORT", "7860"))
-GRADIO_SHARE = os.environ.get("GRADIO_SHARE", "false").lower() == "true"
-GRADIO_SERVER_NAME = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ---------- STT ----------
 from faster_whisper import WhisperModel
-print(f"[INIT] Loading Whisper ({WHISPER_SIZE}) on {DEVICE} …")
-whisper = WhisperModel(
-    WHISPER_SIZE,
-    device=DEVICE,
-    compute_type="float16" if DEVICE == "cuda" else "int8"
-)
+from kokoro import KPipeline
+from llama_cpp import Llama
 
-def transcribe_audio(wav_path: str) -> str:
-    # small beam_size for speed, VAD on
-    segments, _ = whisper.transcribe(wav_path, beam_size=1, vad_filter=True)
-    return " ".join(seg.text for seg in segments).strip()
+# =========================
+# Config
+# =========================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SAMPLE_RATE = 16000
+KOKORO_SR = 24000
 
-# ---------- LLM (llama.cpp) ----------
-from llama_cpp import Llama, LogitsProcessorList
+# UI typing cadence
+WORDS_PER_TICK = 3
+TYPE_TICK_SLEEP = 0.015
 
-print(f"[INIT] Loading GGUF model from: {GGUF_PATH}")
-llm = Llama(
-    model_path=GGUF_PATH,
-    n_ctx=N_CTX,
-    n_threads=N_THREADS,
-    n_gpu_layers=N_GPU_LAYERS,   # 0 = CPU; >0 offloads to GPU (if cuBLAS wheel)
-    use_mlock=True,              # lock in RAM for speed (if permitted)
-    use_mmap=True,               # memory-mapped
-    verbose=False
-)
-
+# LLM output controls
 SYSTEM_PROMPT = (
-    "You are a concise, friendly on-prem voice assistant. "
-    "Answer briefly and clearly. If a task requires the internet, say you are offline."
+    "You are a concise, friendly voice assistant. "
+    "Answer in 1–2 sentences (<= 35 words total)."
+)
+MAX_TOKENS = 160
+MAX_CHARS_TOTAL = 360
+
+
+# =========================
+# Cached loaders
+# =========================
+@st.cache_resource
+def load_vad():
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        trust_repo=True,
+    )
+    model.to(DEVICE)
+    if isinstance(utils, dict):
+        get_speech_timestamps = utils["get_speech_timestamps"]
+        collect_chunks = utils["collect_chunks"]
+    else:
+        get_speech_timestamps, _, _, _, collect_chunks = utils
+    return model, get_speech_timestamps, collect_chunks
+
+
+@st.cache_resource
+def load_whisper():
+    compute_type = "float16" if DEVICE == "cuda" else "int8"
+    return WhisperModel("base.en", device=DEVICE, compute_type=compute_type)
+
+
+@st.cache_resource
+def load_kokoro(lang_code="a"):
+    return KPipeline(lang_code=lang_code)
+
+
+@st.cache_resource
+def load_llm():
+    return Llama(
+        model_path="./models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        n_gpu_layers=-1 if DEVICE == "cuda" else 0,
+        n_ctx=4096,
+        seed=42,
+        verbose=False,
+    )
+
+
+# =========================
+# Helpers
+# =========================
+def ensure_mono_16k_from_path(p: str | os.PathLike) -> torch.Tensor:
+    wav, sr = torchaudio.load(p)
+    if wav.dim() == 2 and wav.shape[0] > 1:
+        wav = torch.mean(wav, dim=0, keepdim=True)
+    elif wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    if sr != SAMPLE_RATE:
+        wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+    return wav
+
+
+def transcribe(whisper_model: WhisperModel, audio_path: str) -> str:
+    segs, _info = whisper_model.transcribe(audio_path, vad_filter=True)
+    return " ".join([s.text.strip() for s in segs]).strip()
+
+
+def kokoro_speak_full(kokoro: KPipeline, text: str, voice: str, speed: float) -> Tuple[np.ndarray, int]:
+    """Synthesize one single clip for the entire final LLM text."""
+    chunks = []
+    for _, _, audio in kokoro(text, voice=voice, speed=speed):
+        chunks.append(audio)
+    if not chunks:
+        return np.zeros(0, dtype=np.float32), KOKORO_SR
+    audio = np.concatenate(chunks, axis=0).astype(np.float32)
+    return audio, KOKORO_SR
+
+
+def llm_answer_stream(history: List[dict]) -> Iterable[str]:
+    llm = load_llm()
+    msgs = []
+    if not history or history[0].get("role") != "system":
+        msgs.append({"role": "system", "content": SYSTEM_PROMPT})
+    msgs.extend(history)
+
+    stream = llm.create_chat_completion(
+        messages=msgs,
+        stream=True,
+        max_tokens=MAX_TOKENS,
+        temperature=0.5,
+        top_p=0.9,
+    )
+    for chunk in stream:
+        if "choices" in chunk:
+            delta = chunk["choices"][0].get("delta", {})
+            piece = delta.get("content")
+            if piece:
+                yield piece
+
+
+# =========================
+# Audio pipeline
+# =========================
+def process_audio_file(audio_path: str) -> str | None:
+    vad_model, get_speech_timestamps, _ = load_vad()
+    whisper_model = load_whisper()
+
+    wav_16k = ensure_mono_16k_from_path(audio_path).to(DEVICE)
+    ts = get_speech_timestamps(wav_16k, vad_model, sampling_rate=SAMPLE_RATE)
+    if not ts:
+        st.warning("🔇 No speech detected.")
+        return None
+
+    with st.spinner("🔎 Transcribing..."):
+        text = transcribe(whisper_model, audio_path)
+
+    if not text:
+        st.warning("🤷 Couldn’t transcribe any text.")
+        return None
+
+    return text
+
+
+def stream_assistant_reply_exact_tts(
+    history: List[dict],
+    kokoro: KPipeline,
+    voice: str,
+    speed: float,
+    ui_text_ph: st.delta_generator.DeltaGenerator,
+) -> str:
+    """Stream text tokens to UI, then synthesize TTS once for the full text."""
+    acc_text = ""
+    char_budget = MAX_CHARS_TOTAL
+    words_since_tick = 0
+
+    for tok in llm_answer_stream(history):
+        if char_budget <= 0:
+            break
+        tok = tok.replace("\n", " ")
+        acc_text += tok
+        char_budget -= len(tok)
+
+        words_since_tick += tok.count(" ")
+        if words_since_tick >= WORDS_PER_TICK:
+            ui_text_ph.markdown(acc_text.strip())
+            words_since_tick = 0
+            time.sleep(TYPE_TICK_SLEEP)
+
+    ui_text_ph.markdown(acc_text.strip())
+
+    # Generate audio
+    audio_np, sr = kokoro_speak_full(kokoro, acc_text.strip(), voice, speed)
+    out_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    sf.write(out_wav, audio_np, sr)
+
+    # Play once (no replay bar)
+    st.markdown(
+        f"""
+        <audio autoplay>
+            <source src="data:audio/wav;base64,{base64.b64encode(open(out_wav,'rb').read()).decode()}" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    return acc_text.strip()
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="On-Prem Voice Chat", page_icon="🎤")
+st.title("🎤 On-Prem Voice Assistant")
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": "Hello 👋, how can I help you today?"}
+    ]
+
+# Sidebar
+with st.sidebar:
+    st.markdown("### Settings")
+    voice = st.selectbox("Voice", ["af_bella", "af_sarah", "am_adam"], index=0)
+    speed = st.slider("Speech speed", 0.6, 1.4, 1.0, 0.05)
+
+# Render chat history
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+
+# ========== Fixed Mic Bar at Bottom ==========
+st.markdown(
+    """
+    <style>
+    .mic-bar {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background: #111;
+        padding: 12px 20px;
+        border-top: 1px solid #333;
+        box-shadow: 0 -2px 6px rgba(0,0,0,0.4);
+        z-index: 1000;
+    }
+    .mic-bar label { color: white !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# Maintain a short rolling history to keep prompt small/fast
-def clamp_history(history: List[Dict[str, str]], max_turns: int = 4) -> List[Dict[str, str]]:
-    # keep last N user/assistant pairs
-    trimmed: List[Dict[str, str]] = []
-    count_pairs = 0
-    for msg in reversed(history):
-        trimmed.append(msg)
-        if msg["role"] == "user":
-            count_pairs += 1
-            if count_pairs >= max_turns:
-                break
-    trimmed.reverse()
-    return trimmed
+st.markdown('<div class="mic-bar">', unsafe_allow_html=True)
+rec_file = st.audio_input("🎙 Speak here…", key="mic_input")
+st.markdown('</div>', unsafe_allow_html=True)
 
-def build_prompt(history: List[Dict[str, str]], user_text: str) -> str:
-    # Simple chat template for speed
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + clamp_history(history) + [
-        {"role": "user", "content": user_text}
-    ]
-    lines = []
-    for m in msgs:
-        if m["role"] == "system":
-            lines.append(f"<|system|>\n{m['content']}")
-        elif m["role"] == "user":
-            lines.append(f"<|user|>\n{m['content']}")
-        else:
-            lines.append(f"<|assistant|>\n{m['content']}")
-    lines.append("<|assistant|>\n")
-    return "\n".join(lines)
 
-def generate_stream(prompt: str):
-    """Yield tokens for streaming text in the UI."""
-    acc = ""
-    for out in llm.create_completion(
-        prompt=prompt,
-        max_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-        stream=True,
-        stop=["<|user|>", "<|system|>", "<|assistant|>"],
-    ):
-        tok = out["choices"][0]["text"]
-        acc += tok
-        yield acc
+# Handle new user input
+if rec_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(rec_file.read())  # ✅ FIX
+        audio_path = tmp.name
 
-# ---------- TTS (Chatterbox) ----------
-from chatterbox.tts import ChatterboxTTS
-print(f"[INIT] Loading Chatterbox TTS on {DEVICE} …")
-tts = ChatterboxTTS.from_pretrained(device=DEVICE)
+    user_text = process_audio_file(audio_path)
+    if user_text:
+        st.session_state["messages"].append({"role": "user", "content": user_text})
+        with st.chat_message("user"):
+            st.markdown(user_text)
 
-def synthesize_speech(text: str, voice_wav: Optional[str] = None) -> str:
-    wav_tensor = tts.generate(
-        text,
-        audio_prompt_path=voice_wav,
-        cfg_weight=TTS_CFG_WEIGHT,
-        exaggeration=TTS_EXAGGERATION,
-    )
-    sr = tts.sr
-    out_path = tempfile.mktemp(suffix=".wav")
-    if wav_tensor.dtype != torch.float32:
-        wav_tensor = wav_tensor.to(torch.float32)
-    torchaudio.save(out_path, wav_tensor.cpu(), sr)
-    return out_path
+        with st.chat_message("assistant"):
+            text_ph = st.empty()
 
-# ---------- Pipeline ----------
-def handle_once(input_audio_path: Optional[str], reference_voice_path: Optional[str], history: List[Dict[str, str]]):
-    if not input_audio_path:
-        return history, "", "", None, None, "Please record or upload audio."
-    # 1) STT
-    try:
-        user_text = transcribe_audio(input_audio_path)
-    except Exception as e:
-        return history, "", "", None, None, f"STT error: {e}"
-    if not user_text:
-        return history, "", "", None, None, "I didn't catch that. Please try again."
+        kokoro = load_kokoro()
+        final_text = stream_assistant_reply_exact_tts(
+            st.session_state["messages"], kokoro, voice, speed, text_ph
+        )
 
-    # 2) LLM (streaming text)
-    prompt = build_prompt(history, user_text)
-    stream = generate_stream(prompt)
-
-    # We’ll stream text in the UI; when it’s done, we generate TTS once.
-    final_text = ""
-    for partial in stream:
-        final_text = partial
-        yield history, user_text, partial, None, None, ""  # stream updates
-
-    # 3) Update history with final text
-    new_history = history + [
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": final_text},
-    ]
-
-    # 4) TTS (after text is done)
-    try:
-        tts_wav = synthesize_speech(final_text, voice_wav=reference_voice_path)
-    except Exception as e:
-        yield new_history, user_text, final_text, None, None, f"TTS error: {e}"
-        return
-
-    yield new_history, user_text, final_text, tts_wav, None, ""
-
-# ---------- UI ----------
-with gr.Blocks(title="On-Prem Voice Agent (Fast)") as demo:
-    gr.Markdown(
-        "# ⚡ On-Prem Voice Agent (Fast)\n"
-        "- **LLM:** GGUF via llama.cpp (CPU/GPU), streamed\n"
-        "- **STT:** Whisper (faster-whisper, INT8 on CPU)\n"
-        "- **TTS:** Chatterbox (local)\n"
-        "Tip: keep utterances ~3–5s for lowest latency."
-    )
-
-    state = gr.State([])
-
-    with gr.Row():
-        mic = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Speak or upload")
-        ref = gr.Audio(sources=["upload"], type="filepath", label="(Optional) Reference Voice")
-
-    with gr.Row():
-        stt_box = gr.Textbox(label="Transcribed (STT)", interactive=False)
-    with gr.Row():
-        llm_box = gr.Textbox(label="Assistant (streaming)", interactive=False, lines=6)
-    with gr.Row():
-        tts_audio = gr.Audio(label="Assistant (TTS)", interactive=False)
-    err_box = gr.Markdown("")
-
-    go = gr.Button("Process")
-    clear = gr.Button("Clear")
-
-    go.click(
-        fn=handle_once,
-        inputs=[mic, ref, state],
-        outputs=[state, stt_box, llm_box, tts_audio, ref, err_box],
-        api_name="process",
-        show_api=False,
-        queue=True,
-    )
-
-    def reset():
-        return [], "", "", None, None, ""
-
-    clear.click(reset, None, [state, stt_box, llm_box, tts_audio, ref, err_box], queue=False)
-
-if __name__ == "__main__":
-    # Gradio v5: either omit queue() or call it without args
-    demo.queue()
-    demo.launch(server_name=GRADIO_SERVER_NAME, server_port=GRADIO_PORT, share=GRADIO_SHARE)
-
+        st.session_state["messages"].append({"role": "assistant", "content": final_text})

@@ -1,11 +1,13 @@
-torch>=2.2.0
-torchaudio>=2.2.0
+# Core app
+streamlit==1.48.1
+streamlit-js-eval==0.1.7
+streamlit-mic-recorder==0.0.8
 
-faster-whisper>=1.0.1
-soundfile>=0.12.1
+# LLM bindings (CPU build by default)
+llama-cpp-python
 
-gradio>=4.44.0
-python-dotenv>=1.0.1
-
-llama-cpp-python>=0.2.85    # CPU works out of the box; use cuBLAS wheel for NVIDIA
-chatterbox-tts==0.1.2
+# TTS + audio
+kokoro==0.9.4
+soundfile==0.13.1
+torchaudio
+torch

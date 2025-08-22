@@ -1,0 +1,19 @@
+# Core app
+streamlit==1.48.1
+streamlit-js-eval==0.1.7
+streamlit-mic-recorder==0.0.8
+
+# LLM bindings (GPU build)
+llama-cpp-python==0.3.16 \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
+# TTS + audio (CUDA 12.4 builds)
+torch==2.6.0+cu124 \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+torchaudio==2.6.0+cu124 \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+torchvision==0.21.0+cu124 \
+    --extra-index-url https://download.pytorch.org/whl/cu124
+
+kokoro==0.9.4
+soundfile==0.13.1
